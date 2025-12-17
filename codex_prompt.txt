@@ -1,0 +1,165 @@
+# Codex 实现指令：ChatGPT Prompt 管理 Chrome 扩展（MV3 + 本地存储）
+
+你是 OpenAI Codex。请根据下述需求实现一个可运行的 Chrome Extension（Manifest V3）。  
+**重要：不要实现任何后端服务；不要做远程请求；不要读 ChatGPT 对话区；不要发送历史 Prompt 原文。**
+
+---
+
+## 0) 交付物
+
+请输出一个完整可构建的代码仓库（文件树 + 全部代码），满足：
+1) `npm install` 后可 `npm run build` 生成可加载的扩展目录（例如 `dist/`）。
+2) 在 Chrome 中以“Load unpacked”加载后，进入 `https://chatgpt.com/` 或 `https://chat.openai.com/` 可使用：
+   - 悬浮 icon（可拖动）
+   - 环形菜单（4 扇区：Builder/Optimizer/Library/Settings）
+   - 右侧抽屉承载页面
+   - 右键菜单“添加到 Prompt 库…”
+   - 本地 Prompt 库（目录 + 标签 + 搜索 + 收藏）
+   - Builder 生成并写入输入框
+   - Optimizer 生成“优化请求 Prompt”并写入输入框（仅偏好画像 + 当前草稿）
+   - 导入/导出 JSON
+3) 无网络请求、无遥测。
+
+---
+
+## 1) 技术栈建议（可调整，但必须可构建）
+- TypeScript
+- Manifest V3
+- 构建：Vite（或其他等价方案）
+- UI：可用原生 DOM + Web Components 或 React/Preact（任选，但请尽量轻量）
+- 内容脚本 UI 必须使用 Shadow DOM 或 CSS 命名空间，避免与 ChatGPT 样式冲突
+
+---
+
+## 2) Manifest 关键要求
+
+- `host_permissions`：
+  - `https://chatgpt.com/*`
+  - `https://chat.openai.com/*`
+
+- `permissions`：
+  - `storage`
+  - `contextMenus`
+  - （如需）`scripting`（如果不用 declarative content_scripts 注入，可不用）
+
+- `background.service_worker`：负责创建 contextMenus、处理导入导出、与 content script 通讯
+
+- `content_scripts`：仅注入到上述两个域名
+
+---
+
+## 3) 主要模块划分（建议的文件结构）
+
+建议实现如下模块（可以不同，但职责必须覆盖）：
+
+1) `src/content/`  
+   - `mount.ts`：注入浮标、环形菜单、抽屉容器（ShadowRoot）
+   - `chatgptInput.ts`：定位/读取/写入 ChatGPT 输入框（textarea 或 contenteditable），并派发 InputEvent
+   - `ui/`：FloatingOrb、RadialMenu、Drawer、页面组件
+
+2) `src/background/`  
+   - `serviceWorker.ts`：注册 contextMenus（仅目标域名），处理菜单点击 -> message 到 content script 打开 SavePrompt 页面
+   - 可选：统一的 message router
+
+3) `src/storage/`（本地库）
+   - `models.ts`：Folder/Prompt/Settings 类型
+   - `repo.ts`：CRUD（folders/prompts/settings/tags），封装 chrome.storage.local/IndexedDB
+   - `importExport.ts`：导入/导出 JSON（合并/覆盖）
+
+4) `src/preference/`  
+   - `profile.ts`：根据 settings + 行为统计生成“偏好画像”（纯规则描述字符串），不得引用 prompt 原文内容
+
+5) `src/options/`（独立设置页，可与抽屉 Data 功能相同）
+   - 允许导入/导出/清空
+
+---
+
+## 4) 功能实现要点（严格）
+
+### 4.1 悬浮 icon + 环形菜单
+- icon 默认锚定在输入框右侧；找不到输入框则固定右下角
+- 支持拖动，位置保存到 settings.iconPosition
+- 环形菜单 4 扇区：Builder/Optimizer/Library/Settings
+- 防出屏：根据 icon 的屏幕象限选择展开方向或缩小半径
+
+### 4.2 右侧抽屉
+- 抽屉容器固定在页面右侧
+- 页面路由：Builder / Optimizer / Library / Settings / SavePrompt
+- 抽屉关闭后不销毁数据状态（至少保持当前页面状态）
+
+### 4.3 Builder（生成 Prompt）
+- 一屏表单字段（Role/Goal/TaskType/Context/OutputSchema/QualityBar/Constraints/InteractionContract）
+- Goal 必填
+- 实时预览生成 Prompt
+- 点击“写入输入框”：覆盖写入 ChatGPT 输入框（不自动发送）
+- 点击“保存到库”：打开 SavePrompt 页面并预填内容为预览文本
+
+### 4.4 Optimizer（快速优化）
+- 读取当前输入框草稿（draft）
+- 生成 preferenceProfile（纯规则描述，不含历史 prompt 原文）
+- 生成“优化请求 Prompt”文本（只包含 preferenceProfile + draft）
+- 点击写入：覆盖写入输入框
+- 提供回填区：用户粘贴优化后的 Prompt -> 回填覆盖写入输入框
+- **禁止**：
+  - 读取 ChatGPT 对话内容
+  - 把历史 prompt 原文拼进请求
+
+### 4.5 Library（Prompt 库）
+- Folder（目录）支持层级 parentId
+- Prompt 支持 tags[]、收藏、使用统计（useCount、lastUsedAt）
+- 支持搜索（标题/内容/标签）
+- 支持过滤（全部/收藏/最近使用）与排序
+- 支持 Prompt 详情编辑并保存
+- 点击“写入”：覆盖写入输入框，并更新使用统计
+
+### 4.6 右键菜单：添加到 Prompt 库
+- background 创建 contextMenu：
+  - title：添加到 Prompt 库…
+  - documentUrlPatterns 限制在 chatgpt.com / chat.openai.com
+- 点击后：获取选中文本（selectionText），发送 message 给 content script：
+  - 打开抽屉到 SavePrompt 页面
+  - 预填 title（前 20 字）和 content（选中文本）
+
+### 4.7 导入/导出 JSON
+- 导出包含：folders/prompts/settings/schemaVersion/exportedAt
+- 导入提供合并/覆盖策略
+- 合并：ID 冲突要重写为新 ID；目录同名默认创建副本目录（安全）
+- 覆盖：清空后写入（需二次确认）
+
+---
+
+## 5) ChatGPT 输入框定位与写入（稳定性要求）
+
+实现 `findChatGPTInput()`：
+- 需要兼容至少两种输入形态：`textarea` 和 `contenteditable`
+- 推荐使用多个 selector 尝试 + MutationObserver 监听 DOM 变化
+- 写入后派发 input 事件：
+  - textarea：`el.value = text; el.dispatchEvent(new InputEvent('input', {bubbles:true}))`
+  - contenteditable：设置 `innerText` 或 `textContent`，并触发 input/key events
+- 失败要有降级：提示用户复制手动粘贴（UI 上提供 Copy）
+
+---
+
+## 6) 代码质量要求
+- TypeScript 严格类型
+- 模块化：UI/存储/消息分离
+- 不要使用任何外部网络请求
+- 所有用户数据只存在本地
+- 提供 README：构建、加载、使用说明、隐私说明
+
+---
+
+## 7) 需求原文（请严格实现）
+- 生效域名范围：chatgpt.com + chat.openai.com
+- 右键“添加 prompt”范围：仅 ChatGPT 页面
+- 快速优化：只使用本地 Prompt 库/本地历史（不读取 ChatGPT 会话内容）
+- 默认 不直接把历史 prompt 原文发给 ChatGPT，只发送本地归纳出来的偏好（语言、结构、质量标准等）
+- 默认写入方式：覆盖输入框
+- Builder 生成后默认动作：只写入输入框
+- Prompt 组织方式：目录 + 标签
+- 导入/导出：V1 就做
+- 模板参考：采用「高效 Prompt 7 大要素」
+
+---
+
+请开始生成代码仓库（包含完整文件树与所有源代码）。
